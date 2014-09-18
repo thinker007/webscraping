@@ -498,6 +498,11 @@ class Download:
             total += len(link)
             return total
 
+        # check for redirect URL
+        self.get(website)
+        redirect_url = self.cache.meta(website).get('url') if self.cache else self.final_url
+        website = redirect_url or website
+        
         domain = urlparse.urlparse(website).netloc
         scraped = adt.HashDict()
         c = CrawlerCallback(max_depth=max_depth)
@@ -508,6 +513,7 @@ class Download:
             _, url = outstanding.pop(0)
             scraped[url] = True
             html = self.get(url)
+
             if html:
                 for email in alg.extract_emails(html):
                     if email not in emails:
@@ -520,6 +526,7 @@ class Download:
                         if link not in scraped:
                             outstanding.append((score(link), link))
                 # sort based on score to crawl most promising first
+                # XXX insertion sort more efficient here
                 outstanding.sort()
         return list(emails)
 
@@ -779,7 +786,7 @@ class StopCrawl(Exception):
     pass
 
 
-def threaded_get(url=None, urls=None, url_iter=None, num_threads=10, dl=None, cb=None, depth=True, wait_finish=True, reuse_queue=False, max_queue=1000, **kwargs):
+def threaded_get(url=None, urls=None, url_iter=None, num_threads=10, dl=None, cb=None, depth=True, wait_finish=True, **kwargs):
     """Download these urls in parallel
 
     url:
@@ -799,25 +806,18 @@ def threaded_get(url=None, urls=None, url_iter=None, num_threads=10, dl=None, cb
         True for depth first search
     wait_finish:
         whether to wait until all download threads have finished before returning
-    reuse_queue:
-        Whether to continue the queue from the previous run.
-    max_queue:
-        The maximum number of queued URLs to keep in memory.
-        The rest will be in the cache.
     """
     if kwargs.pop('cache', None):
         common.logger.debug('threaded_get does not support cache flag')
     lock = threading.Lock()
 
     def is_finished():
-        status = False 
+        status = True 
         if lock.acquire(False):
             for url in url_iter or []:
                 download_queue.append(url)
-                print 'dl queue', download_queue
                 status = False
                 break
-            status = True 
             lock.release()
         return status
 
@@ -834,7 +834,7 @@ def threaded_get(url=None, urls=None, url_iter=None, num_threads=10, dl=None, cb
         def run(self):
             D = Download(**kwargs)
 
-            while self.running and (download_queue or self.processing) or not is_finished():
+            while self.running and (download_queue or not is_finished() or self.processing):
                 # keep track that are processing url
                 self.processing.append(1) 
                 try:
@@ -984,8 +984,6 @@ class State:
 class CrawlerCallback:
     """Example callback to crawl a website
     """
-    found = adt.HashDict(int) # track depth of found URLs
-
     def __init__(self, output_file=None, max_links=100, max_depth=1, allowed_urls='', banned_urls='^$', robots=None, crawl_existing=True):
         """
         output_file:
@@ -1003,6 +1001,7 @@ class CrawlerCallback:
         crawl_existing:
             sets whether to crawl content already downloaded previously in the cache
         """
+        self.found = adt.HashDict(int) # track depth of found URLs
         if output_file:
             self.writer = common.UnicodeWriter(output_file) 
         else:
@@ -1014,22 +1013,35 @@ class CrawlerCallback:
         self.robots = robots
         self.crawl_existing = crawl_existing
 
+
     def __call__(self, D, url, html):
-       # add scraping code here ...
+       # override this method to add scraping code ...
        return self.crawl(D, url, html)                                                                                                          
+
+
+    def normalize(self, url, link):
+        """Normalize the link to avoid duplicates
+
+        >>> cb = CrawlerCallback()
+        >>> cb.normalize('http://example.com', '../abc.html')
+        'http://example.com/abc.html'
+        >>> cb.normalize('http://example.com', 'abc.html#link')
+        'http://example.com/abc.html'
+        >>> cb.normalize('http://example.com', 'abc.html?a=1&amp;b=2')
+        'http://example.com/abc.html?a=1&b=2'
+        """
+        link, _ = urlparse.urldefrag(link) # remove hash to avoid duplicates
+        link = common.unescape(link) # parse escaped characters such as &amp;
+        link = urlparse.urljoin(url, link) # support relative links
+        while urlparse.urlsplit(link).path.startswith('/..'):
+            # remove invalid parent directory
+            link = link.replace('/..', '', 1)
+        return link
+
 
     def crawl(self, D, url, html): 
         """Crawl website html and return list of URLs crawled
         """
-        def normalize(link):
-            """Normalize the link to avoid duplicates
-            """
-            if '#' in link:
-                # remove internal links to avoid duplicates
-                link = link[:link.index('#')] 
-            link = common.unescape(link) # remove &amp; from link
-            return urlparse.urljoin(url, link) # support relative links
-
         def valid(link):
             """Check if should crawl this link
             """
@@ -1048,22 +1060,21 @@ class CrawlerCallback:
                                     return True
             return False
 
-
         domain = common.get_domain(url)
-        depth = CrawlerCallback.found[url]
+        depth = self.found[url]
         outstanding = []
         if depth != self.max_depth: 
             # extract links to continue crawling
             links_re = re.compile('<a[^>]+href=["\'](.*?)["\']', re.IGNORECASE)
             for link in links_re.findall(html):
                 try:
-                    link = normalize(link)
+                    link = self.normalize(url, link)
                 except UnicodeDecodeError as e:
                     # unicode error when joining url
                     common.logger.info(e)
                 else:
-                    if link not in CrawlerCallback.found:
-                        CrawlerCallback.found[link] = depth + 1
+                    if link not in self.found:
+                        self.found[link] = depth + 1
                         if valid(link):
                             # is a new link
                             outstanding.append(link)
